@@ -1,0 +1,235 @@
+from google import genai
+from google.genai import types
+import pandas as pd
+import json
+import time
+import os
+from dotenv import load_dotenv
+import httpx
+
+load_dotenv()
+
+class GeminiCategorizer:
+    def __init__(self):
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        self.base_url = os.getenv("GEMINI_BASE_URL")
+        self.verify_ssl = os.getenv("GEMINI_VERIFY_SSL", "true").lower() == "true"
+        
+        # Configure the new genai Client
+        # The new SDK 1.x handles api_endpoint at the root level, not inside http_options
+        self.client = genai.Client(
+            api_key=self.api_key,
+            vertex=False, # default
+             # Only provide if not None to avoid Pydantic validation errors
+            http_options=types.HttpOptions(api_version='v1beta') if self.base_url else None
+        )
+        
+        # If base_url is provided, we need to set it carefully.
+        # Based on SDK docs, some versions might use 'vertex_base_url' or just 'api_endpoint'
+        if self.base_url:
+            self.client = genai.Client(
+                api_key=self.api_key,
+                # In latest google-genai, the parameter is sometimes base_url or api_endpoint depending on version
+                # Let's try to set it correctly. The error message suggested it's not in http_options.
+                # Common pattern is genai.Client(api_key=key, api_endpoint=url)
+            )
+            # Re-init with api_endpoint if possible. 
+            # If the constructor doesn't like it as a direct keyword, we might need a different approach.
+            # But the error "Extra inputs are not permitted" for HttpOptions confirms it shouldn't be there.
+            try:
+                self.client = genai.Client(api_key=self.api_key, api_endpoint=self.base_url)
+            except:
+                # Fallback if the constructor signature differs (e.g. older/newer version)
+                self.client = genai.Client(api_key=self.api_key)
+
+        # Handle verify_ssl=False globally for the process
+        if not self.verify_ssl:
+            os.environ['PYTHONHTTPSVERIFY'] = '0'
+
+        self.model_name = "gemini-1.5-flash"
+        self.batch_size = 20
+
+    def categorize_tickets(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Main entry point. Applies categorization logic."""
+        df = df.copy()
+        df['AI_Category'] = None
+        df['AI_Subcategory'] = None
+        df['AI_Group'] = None
+        df['Category_Source'] = None
+
+        structured_mask = (
+            df['Item'].notna() &
+            (df['Item'].str.strip().str.lower() != 'general request') &
+            (df['Item'].str.strip() != '')
+        )
+
+        df.loc[structured_mask, 'AI_Category'] = df.loc[structured_mask, 'Item'].str.strip()
+        df.loc[structured_mask, 'AI_Subcategory'] = (
+            df.loc[structured_mask, 'Subcategory 1'].fillna('').str.strip()
+        )
+        df.loc[structured_mask, 'AI_Group'] = df.loc[structured_mask].apply(
+            lambda r: self._build_group_label(r), axis=1
+        )
+        df.loc[structured_mask, 'Category_Source'] = 'Item Field'
+
+        unstructured = df[~structured_mask].copy()
+        if not unstructured.empty:
+            categorized = self._categorize_with_gemini(unstructured)
+            for col in ['AI_Category', 'AI_Subcategory', 'AI_Group', 'Category_Source']:
+                df.loc[~structured_mask, col] = categorized[col].values
+
+        return df
+
+    def _build_group_label(self, row) -> str:
+        parts = [str(row.get('Item', '')).strip()]
+        sub1 = str(row.get('Subcategory 1', '')).strip()
+        sub2 = str(row.get('Subcategory 2', '')).strip()
+        if sub1 and sub1.lower() not in ('nan', ''):
+            parts.append(sub1)
+        if sub2 and sub2.lower() not in ('nan', ''):
+            parts.append(sub2)
+        return ' > '.join(parts)
+
+    def _categorize_with_gemini(self, df: pd.DataFrame) -> pd.DataFrame:
+        results = []
+        indices = df.index.tolist()
+        batches = [indices[i:i + self.batch_size] for i in range(0, len(indices), self.batch_size)]
+
+        print(f"Sending {len(df)} General Request tickets to Gemini in {len(batches)} batches...")
+        for batch_num, batch_indices in enumerate(batches):
+            batch_df = df.loc[batch_indices]
+            batch_results = self._process_batch(batch_df)
+            results.extend(batch_results)
+            print(f"  Batch {batch_num + 1}/{len(batches)} complete.")
+            time.sleep(1)
+
+        result_df = pd.DataFrame(results, index=df.index)
+        return result_df
+
+    def _process_batch(self, batch_df: pd.DataFrame) -> list:
+        tickets_payload = []
+        for idx, row in batch_df.iterrows():
+            tickets_payload.append({
+                "id": str(idx),
+                "short_description": str(row.get('Short Description', '')),
+                "business_service": str(row.get('Business Service', '')),
+                "category": str(row.get('Category', '')),
+                "subcategory_1": str(row.get('Subcategory 1', '')),
+                "subcategory_2": str(row.get('Subcategory 2', ''))
+            })
+
+        prompt = self._build_prompt(tickets_payload)
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt
+                )
+                
+                if not response.text:
+                    raise ValueError("Empty response from Gemini")
+                
+                parsed = self._parse_gemini_response(response.text, batch_df)
+                return parsed
+            except Exception as e:
+                print(f"Gemini API attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    print(f"All {max_retries} attempts failed for batch.")
+
+        return [
+            {
+                'AI_Category': 'Uncategorized',
+                'AI_Subcategory': '',
+                'AI_Group': 'Uncategorized',
+                'Category_Source': 'Fallback (API Error)'
+            }
+            for _ in range(len(batch_df))
+        ]
+
+    def _build_prompt(self, tickets: list) -> str:
+        return f"""
+You are an IT Service Management analyst. Analyze the following service desk tickets and categorize each one.
+
+Rules:
+1. Group similar tickets into meaningful IT service categories (e.g. "DNS - Add/Update/Delete", "AWS Access", "AD Group Access", "Hardware Issue", "Email Problem", "Network Connectivity", "Access & Permissions", "System Performance", etc.)
+2. Use the short_description as primary signal. Use business_service as supporting context.
+3. Assign:
+   - "category": broad IT domain (e.g. "Access Management", "Hardware", "Network", "Software")
+   - "subcategory": specific issue type (e.g. "Password Reset", "Laptop Issue", "VPN", "Office 365")
+   - "group": a clean, consistent bucket label combining both (e.g. "Access Management > Password Reset")
+4. Be consistent — similar descriptions must get the same group label.
+5. Return ONLY a valid pure JSON array of objects.
+6. NO markdown code fences, NO preamble, NO explanation text. Just the JSON.
+
+Tickets:
+{json.dumps(tickets, indent=2)}
+
+Return format (one object per ticket, same order):
+[
+  {{
+    "id": "original_id",
+    "category": "...",
+    "subcategory": "...",
+    "group": "..."
+  }}
+]
+"""
+
+    def _parse_gemini_response(self, response_text: str, batch_df: pd.DataFrame) -> list:
+        try:
+            text = response_text.strip()
+            if "```" in text:
+                parts = text.split("```")
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("json"):
+                        part = part[4:].strip()
+                    if part.startswith("[") and part.endswith("]"):
+                        text = part
+                        break
+                    start = part.find('[')
+                    end = part.rfind(']')
+                    if start != -1 and end != -1 and end > start:
+                        text = part[start:end+1]
+                        break
+
+            if not (text.startswith("[") and text.endswith("]")):
+                start = text.find('[')
+                end = text.rfind(']')
+                if start != -1 and end != -1 and end > start:
+                    text = text[start:end+1]
+
+            parsed = json.loads(text)
+            if not isinstance(parsed, list):
+                if isinstance(parsed, dict) and "tickets" in parsed:
+                    parsed = parsed["tickets"]
+                else:
+                    raise ValueError("Parsed JSON is not a list")
+
+            results_map = {str(item.get('id')): item for item in parsed if 'id' in item}
+            results = []
+            for idx, _ in batch_df.iterrows():
+                item = results_map.get(str(idx), {})
+                results.append({
+                    'AI_Category': item.get('category', 'Uncategorized'),
+                    'AI_Subcategory': item.get('subcategory', ''),
+                    'AI_Group': item.get('group', 'Uncategorized'),
+                    'Category_Source': 'Gemini AI'
+                })
+
+            return results[:len(batch_df)]
+        except Exception as e:
+            print(f"Error parsing Gemini response: {e}")
+            return [
+                {
+                    'AI_Category': 'Uncategorized',
+                    'AI_Subcategory': '',
+                    'AI_Group': 'Uncategorized',
+                    'Category_Source': 'Parsing Error'
+                }
+                for _ in range(len(batch_df))
+            ]
