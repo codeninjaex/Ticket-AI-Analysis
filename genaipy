@@ -1,205 +1,169 @@
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import pandas as pd
-import json
-import time
 import os
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+import shutil
+from typing import Optional
 
-load_dotenv()
+from backend.gemini_categorizer import GeminiCategorizer
+from backend.effort_extractor import EffortExtractor
+from backend.analysis import TicketAnalyzer
+from backend.excel_exporter import ExcelExporter
 
-class GeminiCategorizer:
-    def __init__(self):
-        # We keep the class name for backward compatibility in the pipeline
-        self.api_key = os.getenv("OPENAI_API_KEY") or os.getenv("GEMINI_API_KEY")
-        self.base_url = os.getenv("OPENAI_API_BASE") or os.getenv("GEMINI_BASE_URL")
-        self.model_name = os.getenv("OPENAI_MODEL_NAME") or "gpt-4o"
-        
-        # Initialize LangChain ChatOpenAI
-        # This can point to OpenAI or any OpenAI-compatible proxy (like LiteLLM for Gemini)
-        self.llm = ChatOpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url if self.base_url else None,
-            model=self.model_name,
-            temperature=0,
-            max_retries=3
-        )
-        
-        self.batch_size = 20
+app = FastAPI(title="Ticket AI Analysis API")
 
-    def categorize_tickets(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Main entry point. Applies categorization logic."""
-        df = df.copy()
-        df['AI_Category'] = None
-        df['AI_Subcategory'] = None
-        df['AI_Group'] = None
-        df['Category_Source'] = None
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-        structured_mask = (
-            df['Item'].notna() &
-            (df['Item'].str.strip().str.lower() != 'general request') &
-            (df['Item'].str.strip() != '')
-        )
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs('output', exist_ok=True)
 
-        df.loc[structured_mask, 'AI_Category'] = df.loc[structured_mask, 'Item'].str.strip()
-        df.loc[structured_mask, 'AI_Subcategory'] = (
-            df.loc[structured_mask, 'Subcategory 1'].fillna('').str.strip()
-        )
-        df.loc[structured_mask, 'AI_Group'] = df.loc[structured_mask].apply(
-            lambda r: self._build_group_label(r), axis=1
-        )
-        df.loc[structured_mask, 'Category_Source'] = 'Item Field'
+# Global state
+pipeline_results = {
+    'df': None,
+    'analyzer': None,
+    'status': 'idle',
+    'message': '',
+    'error': None
+}
 
-        unstructured = df[~structured_mask].copy()
-        if not unstructured.empty:
-            categorized = self._categorize_with_gemini(unstructured)
-            for col in ['AI_Category', 'AI_Subcategory', 'AI_Group', 'Category_Source']:
-                df.loc[~structured_mask, col] = categorized[col].values
-
-        return df
-
-    def _build_group_label(self, row) -> str:
-        parts = [str(row.get('Item', '')).strip()]
-        sub1 = str(row.get('Subcategory 1', '')).strip()
-        sub2 = str(row.get('Subcategory 2', '')).strip()
-        if sub1 and sub1.lower() not in ('nan', ''):
-            parts.append(sub1)
-        if sub2 and sub2.lower() not in ('nan', ''):
-            parts.append(sub2)
-        return ' > '.join(parts)
-
-    def _categorize_with_gemini(self, df: pd.DataFrame) -> pd.DataFrame:
-        results = []
-        indices = df.index.tolist()
-        batches = [indices[i:i + self.batch_size] for i in range(0, len(indices), self.batch_size)]
-
-        print(f"Sending {len(df)} General Request tickets to AI in {len(batches)} batches...")
-        for batch_num, batch_indices in enumerate(batches):
-            batch_df = df.loc[batch_indices]
-            batch_results = self._process_batch(batch_df)
-            results.extend(batch_results)
-            print(f"  Batch {batch_num + 1}/{len(batches)} complete.")
-            time.sleep(1)
-
-        result_df = pd.DataFrame(results, index=df.index)
-        return result_df
-
-    def _process_batch(self, batch_df: pd.DataFrame) -> list:
-        tickets_payload = []
-        for idx, row in batch_df.iterrows():
-            tickets_payload.append({
-                "id": str(idx),
-                "short_description": str(row.get('Short Description', '')),
-                "business_service": str(row.get('Business Service', '')),
-                "category": str(row.get('Category', '')),
-                "subcategory_1": str(row.get('Subcategory 1', '')),
-                "subcategory_2": str(row.get('Subcategory 2', ''))
-            })
-
-        prompt = self._build_prompt(tickets_payload)
-        
+def load_csv_robustly(filepath: str) -> pd.DataFrame:
+    """Try various encodings to load the CSV safely"""
+    encodings = ['utf-8', 'latin-1', 'utf-8-sig', 'cp1252']
+    for enc in encodings:
         try:
-            # LANGCHAIN INVOKE
-            response = self.llm.invoke([HumanMessage(content=prompt)])
-            
-            if not response.content:
-                raise ValueError("Empty response from AI")
-            
-            parsed = self._parse_gemini_response(response.content, batch_df)
-            return parsed
-        except Exception as e:
-            print(f"AI Batch Processing failed: {e}")
-            return [
-                {
-                    'AI_Category': 'Uncategorized',
-                    'AI_Subcategory': '',
-                    'AI_Group': 'Uncategorized',
-                    'Category_Source': 'Fallback (AI Error)'
-                }
-                for _ in range(len(batch_df))
-            ]
+            df = pd.read_csv(filepath, encoding=enc)
+            if df.empty:
+                raise ValueError("The uploaded CSV is empty.")
+            return df
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+    return pd.read_csv(filepath)
 
-    def _build_prompt(self, tickets: list) -> str:
-        return f"""
-You are an IT Service Management analyst. Analyze the following service desk tickets and categorize each one.
+def run_pipeline(filepath: str):
+    global pipeline_results
+    try:
+        pipeline_results['status'] = 'running'
+        pipeline_results['error'] = None
+        pipeline_results['message'] = 'Loading and detecting CSV encoding...'
+        print(f"\n[BACKEND] Starting pipeline for: {filepath}")
 
-Rules:
-1. Group similar tickets into meaningful IT service categories (e.g. "DNS - Add/Update/Delete", "AWS Access", "AD Group Access", "Hardware Issue", "Email Problem", "Network Connectivity", "Access & Permissions", "System Performance", etc.)
-2. Use the short_description as primary signal. Use business_service as supporting context.
-3. Assign:
-   - "category": broad IT domain (e.g. "Access Management", "Hardware", "Network", "Software")
-   - "subcategory": specific issue type (e.g. "Password Reset", "Laptop Issue", "VPN", "Office 365")
-   - "group": a clean, consistent bucket label combining both (e.g. "Access Management > Password Reset")
-4. Be consistent — similar descriptions must get the same group label.
-5. Return ONLY a valid pure JSON array of objects.
-6. NO markdown code fences, NO preamble, NO explanation text. Just the JSON.
+        df = load_csv_robustly(filepath)
+        print(f"[BACKEND] Success: Loaded {len(df)} rows. Columns: {df.columns.tolist()}")
 
-Tickets:
-{json.dumps(tickets, indent=2)}
+        pipeline_results['message'] = 'Categorizing with Gemini AI...'
+        print("[BACKEND] Initiating Gemini Categorization...")
+        categorizer = GeminiCategorizer()
+        df = categorizer.categorize_tickets(df)
+        print("[BACKEND] Gemini Categorization complete.")
 
-Return format (one object per ticket, same order):
-[
-  {{
-    "id": "original_id",
-    "category": "...",
-    "subcategory": "...",
-    "group": "..."
-  }}
-]
-"""
+        pipeline_results['message'] = 'Extracting effort from work notes...'
+        print("[BACKEND] Starting Effort Extraction...")
+        extractor = EffortExtractor()
+        df = extractor.extract_effort(df)
+        print("[BACKEND] Effort Extraction complete.")
 
-    def _parse_gemini_response(self, response_text: str, batch_df: pd.DataFrame) -> list:
-        try:
-            text = response_text.strip()
-            # Clean up potential markdown fences if some LLMs ignore the prompt rules
-            if "```" in text:
-                parts = text.split("```")
-                for part in parts:
-                    part = part.strip()
-                    if part.startswith("json"):
-                        part = part[4:].strip()
-                    if part.startswith("[") and part.endswith("]"):
-                        text = part
-                        break
-                    start = part.find('[')
-                    end = part.rfind(']')
-                    if start != -1 and end != -1 and end > start:
-                        text = part[start:end+1]
-                        break
+        pipeline_results['message'] = 'Running analysis engine...'
+        print("[BACKEND] Running Ticket Analysis Engine...")
+        analyzer = TicketAnalyzer(df)
 
-            if not (text.startswith("[") and text.endswith("]")):
-                start = text.find('[')
-                end = text.rfind(']')
-                if start != -1 and end != -1 and end > start:
-                    text = text[start:end+1]
+        pipeline_results['message'] = 'Generating Excel visualization...'
+        print("[BACKEND] Generating Excel Report...")
+        exporter = ExcelExporter()
+        exporter.export(df, analyzer)
+        print("[BACKEND] Excel Report generated at: output/ticket_analysis.xlsx")
 
-            parsed = json.loads(text)
-            if not isinstance(parsed, list):
-                if isinstance(parsed, dict) and "tickets" in parsed:
-                    parsed = parsed["tickets"]
-                else:
-                    raise ValueError("Parsed JSON is not a list")
+        pipeline_results['df'] = df
+        pipeline_results['analyzer'] = analyzer
+        pipeline_results['status'] = 'complete'
+        pipeline_results['message'] = 'Analysis complete'
+        print("[BACKEND] Pipeline finished successfully.\n")
 
-            results_map = {str(item.get('id')): item for item in parsed if 'id' in item}
-            results = []
-            for idx, _ in batch_df.iterrows():
-                item = results_map.get(str(idx), {})
-                results.append({
-                    'AI_Category': item.get('category', 'Uncategorized'),
-                    'AI_Subcategory': item.get('subcategory', ''),
-                    'AI_Group': item.get('group', 'Uncategorized'),
-                    'Category_Source': 'AI Analysis'
-                })
+    except Exception as e:
+        pipeline_results['status'] = 'error'
+        pipeline_results['message'] = 'Pipeline failed'
+        pipeline_results['error'] = str(e)
+        print(f"[BACKEND] Pipeline error: {e}")
 
-            return results[:len(batch_df)]
-        except Exception as e:
-            print(f"Error parsing AI response: {e}")
-            return [
-                {
-                    'AI_Category': 'Uncategorized',
-                    'AI_Subcategory': '',
-                    'AI_Group': 'Uncategorized',
-                    'Category_Source': 'Parsing Error'
-                }
-                for _ in range(len(batch_df))
-            ]
+@app.post("/api/upload")
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Handle multipart file upload and start pipeline in background"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No selected file")
+    
+    filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+    with open(filepath, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    # Reset state
+    global pipeline_results
+    pipeline_results['status'] = 'running'
+    pipeline_results['message'] = 'Upload received, initializing pipeline...'
+    pipeline_results['df'] = None
+    pipeline_results['analyzer'] = None
+    pipeline_results['error'] = None
+    
+    # Add to background tasks
+    background_tasks.add_task(run_pipeline, filepath)
+    
+    return {
+        'status': 'running', 
+        'message': 'Analysis started in background.'
+    }
+
+@app.get("/api/status")
+async def get_status():
+    return {
+        'status': pipeline_results['status'],
+        'message': pipeline_results['message'],
+        'error': pipeline_results['error']
+    }
+
+@app.get("/api/summary")
+async def get_summary():
+    if not pipeline_results['analyzer']:
+        raise HTTPException(status_code=400, detail="No analysis data available. Please upload a file first.")
+    return pipeline_results['analyzer'].get_summary()
+
+@app.get("/api/heavy-hitters")
+async def get_heavy_hitters(top_n: int = 15):
+    if not pipeline_results['analyzer']:
+        raise HTTPException(status_code=400, detail="No data")
+    return pipeline_results['analyzer'].get_heavy_hitters(top_n)
+
+@app.get("/api/effort")
+async def get_effort():
+    if not pipeline_results['analyzer']:
+        raise HTTPException(status_code=400, detail="No data")
+    return pipeline_results['analyzer'].get_effort_summary()
+
+@app.get("/api/category-breakdown")
+async def get_category_breakdown():
+    if not pipeline_results['analyzer']:
+        raise HTTPException(status_code=400, detail="No data")
+    return pipeline_results['analyzer'].get_category_breakdown()
+
+@app.get("/api/volume-trends")
+async def get_volume_trends():
+    if not pipeline_results['analyzer']:
+        raise HTTPException(status_code=400, detail="No data")
+    return pipeline_results['analyzer'].get_volume_by_month()
+
+@app.get("/api/download-excel")
+async def download_excel():
+    path = 'output/ticket_analysis.xlsx'
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Excel report not found. Has the analysis finished?")
+    return FileResponse(path, filename="ticket_analysis.xlsx")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
