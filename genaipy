@@ -1,33 +1,30 @@
-from google import genai
-from google.genai import types
 import pandas as pd
 import json
 import time
 import os
 from dotenv import load_dotenv
-import httpx
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
 load_dotenv()
 
 class GeminiCategorizer:
     def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY")
-        self.base_url = os.getenv("GEMINI_BASE_URL")
-        self.verify_ssl = os.getenv("GEMINI_VERIFY_SSL", "true").lower() == "true"
+        # We keep the class name for backward compatibility in the pipeline
+        self.api_key = os.getenv("OPENAI_API_KEY") or os.getenv("GEMINI_API_KEY")
+        self.base_url = os.getenv("OPENAI_API_BASE") or os.getenv("GEMINI_BASE_URL")
+        self.model_name = os.getenv("OPENAI_MODEL_NAME") or "gpt-4o"
         
-        # Configure the new genai Client
-        # The new SDK handles base_url and custom http clients via HttpOptions
-        http_opts = types.HttpOptions(
-            base_url=self.base_url if self.base_url else None,
-            httpx_client=httpx.Client(verify=self.verify_ssl)
-        )
-        
-        self.client = genai.Client(
+        # Initialize LangChain ChatOpenAI
+        # This can point to OpenAI or any OpenAI-compatible proxy (like LiteLLM for Gemini)
+        self.llm = ChatOpenAI(
             api_key=self.api_key,
-            http_options=http_opts
+            base_url=self.base_url if self.base_url else None,
+            model=self.model_name,
+            temperature=0,
+            max_retries=3
         )
         
-        self.model_name = "gemini-1.5-flash"
         self.batch_size = 20
 
     def categorize_tickets(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -76,7 +73,7 @@ class GeminiCategorizer:
         indices = df.index.tolist()
         batches = [indices[i:i + self.batch_size] for i in range(0, len(indices), self.batch_size)]
 
-        print(f"Sending {len(df)} General Request tickets to Gemini in {len(batches)} batches...")
+        print(f"Sending {len(df)} General Request tickets to AI in {len(batches)} batches...")
         for batch_num, batch_indices in enumerate(batches):
             batch_df = df.loc[batch_indices]
             batch_results = self._process_batch(batch_df)
@@ -101,36 +98,26 @@ class GeminiCategorizer:
 
         prompt = self._build_prompt(tickets_payload)
         
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # NEW SDK SYNTAX
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt
-                )
-                
-                if not response.text:
-                    raise ValueError("Empty response from Gemini")
-                
-                parsed = self._parse_gemini_response(response.text, batch_df)
-                return parsed
-            except Exception as e:
-                print(f"Gemini API attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    print(f"All {max_retries} attempts failed for batch.")
-
-        return [
-            {
-                'AI_Category': 'Uncategorized',
-                'AI_Subcategory': '',
-                'AI_Group': 'Uncategorized',
-                'Category_Source': 'Fallback (API Error)'
-            }
-            for _ in range(len(batch_df))
-        ]
+        try:
+            # LANGCHAIN INVOKE
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            
+            if not response.content:
+                raise ValueError("Empty response from AI")
+            
+            parsed = self._parse_gemini_response(response.content, batch_df)
+            return parsed
+        except Exception as e:
+            print(f"AI Batch Processing failed: {e}")
+            return [
+                {
+                    'AI_Category': 'Uncategorized',
+                    'AI_Subcategory': '',
+                    'AI_Group': 'Uncategorized',
+                    'Category_Source': 'Fallback (AI Error)'
+                }
+                for _ in range(len(batch_df))
+            ]
 
     def _build_prompt(self, tickets: list) -> str:
         return f"""
@@ -164,6 +151,7 @@ Return format (one object per ticket, same order):
     def _parse_gemini_response(self, response_text: str, batch_df: pd.DataFrame) -> list:
         try:
             text = response_text.strip()
+            # Clean up potential markdown fences if some LLMs ignore the prompt rules
             if "```" in text:
                 parts = text.split("```")
                 for part in parts:
@@ -200,12 +188,12 @@ Return format (one object per ticket, same order):
                     'AI_Category': item.get('category', 'Uncategorized'),
                     'AI_Subcategory': item.get('subcategory', ''),
                     'AI_Group': item.get('group', 'Uncategorized'),
-                    'Category_Source': 'Gemini AI'
+                    'Category_Source': 'AI Analysis'
                 })
 
             return results[:len(batch_df)]
         except Exception as e:
-            print(f"Error parsing Gemini response: {e}")
+            print(f"Error parsing AI response: {e}")
             return [
                 {
                     'AI_Category': 'Uncategorized',
