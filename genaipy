@@ -16,36 +16,17 @@ class GeminiCategorizer:
         self.verify_ssl = os.getenv("GEMINI_VERIFY_SSL", "true").lower() == "true"
         
         # Configure the new genai Client
-        # The new SDK 1.x handles api_endpoint at the root level, not inside http_options
-        self.client = genai.Client(
-            api_key=self.api_key,
-            vertex=False, # default
-             # Only provide if not None to avoid Pydantic validation errors
-            http_options=types.HttpOptions(api_version='v1beta') if self.base_url else None
+        # The new SDK handles base_url and custom http clients via HttpOptions
+        http_opts = types.HttpOptions(
+            base_url=self.base_url if self.base_url else None,
+            httpx_client=httpx.Client(verify=self.verify_ssl)
         )
         
-        # If base_url is provided, we need to set it carefully.
-        # Based on SDK docs, some versions might use 'vertex_base_url' or just 'api_endpoint'
-        if self.base_url:
-            self.client = genai.Client(
-                api_key=self.api_key,
-                # In latest google-genai, the parameter is sometimes base_url or api_endpoint depending on version
-                # Let's try to set it correctly. The error message suggested it's not in http_options.
-                # Common pattern is genai.Client(api_key=key, api_endpoint=url)
-            )
-            # Re-init with api_endpoint if possible. 
-            # If the constructor doesn't like it as a direct keyword, we might need a different approach.
-            # But the error "Extra inputs are not permitted" for HttpOptions confirms it shouldn't be there.
-            try:
-                self.client = genai.Client(api_key=self.api_key, api_endpoint=self.base_url)
-            except:
-                # Fallback if the constructor signature differs (e.g. older/newer version)
-                self.client = genai.Client(api_key=self.api_key)
-
-        # Handle verify_ssl=False globally for the process
-        if not self.verify_ssl:
-            os.environ['PYTHONHTTPSVERIFY'] = '0'
-
+        self.client = genai.Client(
+            api_key=self.api_key,
+            http_options=http_opts
+        )
+        
         self.model_name = "gemini-1.5-flash"
         self.batch_size = 20
 
@@ -123,6 +104,7 @@ class GeminiCategorizer:
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                # NEW SDK SYNTAX
                 response = self.client.models.generate_content(
                     model=self.model_name,
                     contents=prompt
